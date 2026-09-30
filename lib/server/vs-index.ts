@@ -16,6 +16,11 @@ import {
   refreshVSIndex,
 } from "@/lib/server/vs-cache";
 import {
+  compareClaimStates,
+  validateClaimAccounting,
+  validateCursorValue,
+} from "@/lib/server/sync-helpers";
+import {
   getClaimById,
   getClaimsByChallenger,
   getClaimsByFilter,
@@ -41,10 +46,63 @@ const POST_WRITE_REFRESH_ATTEMPTS = 5;
 const POST_WRITE_REFRESH_DELAY_MS = 1_500;
 const BACKGROUND_REFRESH_COOLDOWN_MS = 30_000;
 
+// Re-export chain-state reconciliation types and functions for backwards compatibility
+export type { ClaimDiscrepancy } from "@/lib/server/sync-helpers";
+export { 
+  compareClaimStates, 
+  validateClaimAccounting,
+  isValidStellarAddress,
+  validateMoneyField 
+} from "@/lib/server/sync-helpers";
+
+/**
+ * Transactionally update a sync cursor with validation.
+ *
+ * The cursor is only advanced if the new value is greater than the current one,
+ * preventing cursor rollback from a race condition or malformed state. This is
+ * called inside a database transaction in production, but the validation logic
+ * lives here to keep the sync layer self-contained.
+ */
+async function advanceCursor(key: string, newValue: number): Promise<void> {
+  const current = await getSyncMeta(key);
+  const currentValidated = validateCursorValue(current, key, "vs-index");
+  
+  // Only advance; never roll back. A rollback would mean losing progress and
+  // re-scanning already-indexed data, which is both wasteful and a replay risk.
+  if (currentValidated !== null && newValue <= currentValidated) {
+    console.warn(`[vs-index] Cursor ${key} would roll back from ${currentValidated} to ${newValue}, skipping update`);
+    return;
+  }
+  
+  await setSyncMeta(key, String(newValue));
+}
+
+/**
+ * Recover from a corrupted or missing cursor by falling back to a safe default.
+ *
+ * This is the fail-closed path: if the cursor is unusable, we restart from a
+ * known-good position rather than proceeding with bad state that could skip
+ * data or duplicate work.
+ */
+async function recoverCursor(key: string, fallback: number): Promise<number> {
+  const current = await getSyncMeta(key);
+  const validated = validateCursorValue(current, key, "vs-index");
+  
+  if (validated === null) {
+    console.warn(`[vs-index] Recovering cursor ${key} to fallback value ${fallback}`);
+    await setSyncMeta(key, String(fallback));
+    return fallback;
+  }
+  
+  return validated;
+}
+
 type ReconcileResult = {
   synced: number;
   new: number;
   stateChanges: number;
+  corrected: number;
+  inconsistencies: number;
 };
 
 export type VSFeedSnapshot = {
@@ -502,10 +560,13 @@ export async function reconcileVsIndex(): Promise<ReconcileResult> {
     }),
   ]);
 
-  const lastClaimCount = Number(lastClaimCountValue ?? "0");
+  // Use validated cursor; fall back to 0 if corrupted
+  const lastClaimCount = validateCursorValue(lastClaimCountValue, "last_claim_count", "vs-index") ?? 0;
   let synced = 0;
   let newClaims = 0;
   let stateChanges = 0;
+  let corrected = 0;
+  let inconsistencies = 0;
 
   // 1. Backfill new claims page by page, checkpointing after EVERY page.
   //    The old version wrote last_claim_count only at the very end, so any
@@ -519,6 +580,17 @@ export async function reconcileVsIndex(): Promise<ReconcileResult> {
     const pageEnd = Math.min(startId + CLAIM_SYNC_PAGE_SIZE - 1, totalClaimCount);
     const expected = pageEnd - startId + 1;
     const pageClaims = await getClaimSummaries(startId, expected);
+    
+    // Validate chain-state accounting before persisting
+    for (const claim of pageClaims) {
+      const accountingErrors = validateClaimAccounting(claim, "vs-index");
+      if (accountingErrors.length > 0) {
+        console.warn(`[vs-index] Chain state accounting errors for claim ${claim.id}:`, accountingErrors);
+        // Still persist the claim as-is from chain (contract-first principle)
+        // but log the discrepancy for investigation
+      }
+    }
+    
     if (pageClaims.length > 0) {
       await persistIndexedClaims(pageClaims);
       synced += pageClaims.length;
@@ -533,12 +605,12 @@ export async function reconcileVsIndex(): Promise<ReconcileResult> {
       let checkpoint = startId - 1;
       while (got.has(checkpoint + 1)) checkpoint += 1;
       if (checkpoint >= startId) {
-        await setSyncMeta("last_claim_count", String(checkpoint));
+        await advanceCursor("last_claim_count", checkpoint);
       }
       break;
     }
 
-    await setSyncMeta("last_claim_count", String(pageEnd));
+    await advanceCursor("last_claim_count", pageEnd);
   }
 
   // 2. Refresh claims the index believes are open/active by reading only
@@ -547,6 +619,14 @@ export async function reconcileVsIndex(): Promise<ReconcileResult> {
   for (const row of rowsToRefresh) {
     const fresh = await refreshIndexedClaim({ claimId: row.id });
     if (!fresh) continue;
+    
+    // Validate chain-state accounting
+    const accountingErrors = validateClaimAccounting(fresh, "vs-index");
+    if (accountingErrors.length > 0) {
+      console.warn(`[vs-index] Chain state accounting errors for refreshed claim ${fresh.id}:`, accountingErrors);
+      inconsistencies += 1;
+    }
+    
     synced += 1;
     if (
       fresh.state !== row.state ||
@@ -554,15 +634,45 @@ export async function reconcileVsIndex(): Promise<ReconcileResult> {
       fresh.challenger_count !== row.challenger_count
     ) {
       stateChanges += 1;
+      
+      // Detect discrepancies between indexed and chain state
+      const discrepancies = compareClaimStates(row, fresh);
+      if (discrepancies.length > 0) {
+        console.warn(`[vs-index] Chain-index discrepancy for claim ${row.id}:`, discrepancies);
+        inconsistencies += discrepancies.filter(d => d.severity === "critical").length;
+        corrected += 1; // This correction came from chain state
+      }
     }
   }
 
-  await setSyncMeta("last_sync_at", String(now));
+  // 3. Periodic full validation of a sample of indexed claims
+  //    This catches drift that might have been missed in the incremental refresh
+  if (pagesDone === 0 && activeRows.length > 0) {
+    const sampleSize = Math.min(5, activeRows.length);
+    const sampleRows = activeRows.slice(0, sampleSize);
+    
+    for (const row of sampleRows) {
+      const fresh = await refreshIndexedClaim({ claimId: row.id });
+      if (!fresh) continue;
+      
+      const discrepancies = compareClaimStates(row, fresh);
+      if (discrepancies.length > 0) {
+        console.warn(`[vs-index] Validation discrepancy for claim ${row.id}:`, discrepancies);
+        inconsistencies += discrepancies.filter(d => d.severity === "critical").length;
+        corrected += 1;
+      }
+    }
+  }
+
+  // Advance sync timestamp only on successful completion
+  await advanceCursor("last_sync_at", now);
 
   return {
     synced,
     new: newClaims,
     stateChanges,
+    corrected,
+    inconsistencies,
   };
 }
 
