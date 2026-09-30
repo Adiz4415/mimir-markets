@@ -158,7 +158,7 @@ pub fn challenge_claim(
     let mut list = storage::challengers(env, claim_id);
     for existing in list.iter() {
         if existing.address == challenger {
-            return Err(Error::AlreadyChallenged);
+            return Ok(());
         }
     }
     let max_challengers = claim.market.max_challengers.min(MAX_CHALLENGERS);
