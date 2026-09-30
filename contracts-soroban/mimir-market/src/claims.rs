@@ -245,6 +245,7 @@ pub fn challenge_claim(
     claim.total_challenger_stake = next_total_challenger_stake;
     claim.challenger_count = next_challenger_count;
     claim.state = ClaimState::Active;
+    util::assert_claim_conservation(&claim)?;
     storage::set_claim(env, claim_id, &claim);
 
     events::EscrowSeeded {
@@ -408,6 +409,7 @@ pub fn cancel_claim(env: &Env, claim_id: u64) -> Result<(), Error> {
 
     claim.state = ClaimState::Cancelled;
     let creator = claim.creator.clone();
+    util::assert_claim_conservation(&claim)?;
     storage::set_claim(env, claim_id, &claim);
 
     events::ClaimStateTransitioned {
