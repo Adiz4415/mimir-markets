@@ -70,6 +70,8 @@ function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { "cache-control": "no-store" } });
 }
 
+import { withRequestId } from "@/lib/api/errors";
+
 /** Convert a structured ApiErrorResult from lib/api/errors into a Response. */
 /** Map an authorizeAction() rejection to the typed agent API error envelope. */
 function actionVerdictToError(
@@ -226,14 +228,14 @@ async function handleAgentApiPost(
   context: { params: Promise<{ action: string }> },
 ): Promise<Response> {
   const { action: rawAction } = await context.params;
-  if (!(AGENT_API_ACTIONS as readonly string[]).includes(rawAction)) return json({ error: { message: "unknown action" } }, 404);
+  if (!(AGENT_API_ACTIONS as readonly string[]).includes(rawAction)) return json({ error: { message: "unknown action", requestId } }, 404);
   const action = rawAction as AgentApiAction;
   // Cap before parse: Content-Length is a cheap fail-closed gate; the body byte
   // check below still applies when the header is absent or wrong.
   const declared = Number(req.headers.get("content-length") ?? NaN);
   if (Number.isFinite(declared) && declared > MAX_SIGNED_REQUEST_PAYLOAD_BYTES) {
     return json({
-      error: { message: `payload exceeds ${MAX_SIGNED_REQUEST_PAYLOAD_BYTES} bytes` },
+      error: { message: `payload exceeds ${MAX_SIGNED_REQUEST_PAYLOAD_BYTES} bytes`, requestId },
     }, 413);
   }
   let raw: string;
