@@ -507,11 +507,60 @@ async function handleAgentApiPost(
     const revoked = revokeAgent(agent, { requestedBy: agent.ownerWallet, reason: String(body.reason ?? "owner revoked") });
     if (!revoked.ok) return json({ error: { message: revoked.reason } }, 403);
     await saveAgent(revoked.agent); result = { agent: revoked.agent };
+  } else if (action === "fetchResearch") {
+    const gate = authorizeAction(agent, { capability: "researcher", requestsThisHour: Number(body.requestsThisHour ?? 0) });
+    if (!gate.allowed) {
+      await audit(request, "rejected", gate.reason);
+      return json({ error: { message: gate.reason, detail: gate.detail } }, 403);
+    }
+    const adapterId = typeof body.adapterId === "string" ? body.adapterId : "";
+    const url = typeof body.url === "string" ? body.url : "";
+    if (!url || !adapterId) {
+      return errorResponse(apiError("invalid_request", "url and adapterId are required"));
+    }
+    const fetchRes = await fetchWithAdapter(adapterId, { url, agentId: agent.agentId });
+    if (!fetchRes.ok) {
+      if (fetchRes.kind === "adapter") return errorResponse(apiError("invalid_request", fetchRes.detail));
+      let code: ApiErrorCode;
+      switch (fetchRes.kind) {
+        case "paused": code = "agent_paused"; break;
+        case "blocked": code = "forbidden"; break;
+        case "budget": code = "budget_exhausted"; break;
+        case "too_many_redirects":
+        case "redirect_loop":
+        case "invalid_redirect":
+        case "protocol_downgrade":
+        case "content_type":
+        case "too_large":
+        case "http_error":
+          code = "invalid_request"; break;
+        case "cancelled":
+        case "dependency_failure":
+        case "transport":
+          code = "upstream_unavailable"; break;
+      }
+      return errorResponse(apiError(code, fetchRes.detail));
+    }
+    result = {
+      ok: true,
+      url: fetchRes.url,
+      finalUrl: fetchRes.finalUrl,
+      status: fetchRes.status,
+      contentType: fetchRes.contentType,
+      body: fetchRes.body,
+      contentHash: fetchRes.contentHash,
+      capturedAt: fetchRes.capturedAt,
+      bytes: fetchRes.bytes,
+      fromCache: fetchRes.fromCache,
+      redirects: fetchRes.redirects,
+      redirectChain: fetchRes.redirectChain,
+      budget: budgetRemaining(agent.agentId),
+    };
   } else if (action === "publishReasoning") {
     const gate = authorizeAction(agent, { capability: "researcher", requestsThisHour: Number(body.requestsThisHour ?? 0) });
     if (!gate.allowed) {
       await audit(request, "rejected", gate.reason);
-      return errorResponse(actionVerdictToError(gate, "researcher"));
+      return json({ error: { message: gate.reason, detail: gate.detail } }, 403);
     }
     result = await publishReasoning({ ...(body as any), agentId: agent.agentId });
   } else {
