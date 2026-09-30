@@ -59,6 +59,9 @@ pub fn resolve_claim_versioned(
     storage::oracle(env)?.require_auth();
 
     let mut claim = storage::get_claim(env, claim_id)?;
+    // Decode first: an unknown version must never be written, and `None` is not
+    // a settled verdict. Both refusals leave the claim untouched.
+    let winner_side = verdict.decode()?;
     if claim.state == ClaimState::Resolved {
         // Idempotent replay: same decoded verdict and inputs is a no-op.
         if verdict.decode().ok() == Some(claim.winner_side)
