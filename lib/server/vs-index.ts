@@ -15,6 +15,7 @@ import {
   getVSByIdFast as getVsByIdFromCache,
   refreshVSIndex,
 } from "@/lib/server/vs-cache";
+import { validateCursorValue } from "@/lib/server/sync-helpers";
 import {
   compareClaimStates,
   validateClaimAccounting,
